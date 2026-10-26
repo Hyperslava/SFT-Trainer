@@ -150,6 +150,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--bs", type=int, default=1, help="per-device train batch size")
     p.add_argument("--grad-accum", type=int, default=16)
+    p.add_argument("--num-workers", type=int, default=2, help="dataloader workers (raise on a fast GPU)")
     p.add_argument("--max-len", type=int, default=2048)
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--lora-alpha", type=int, default=32)
@@ -288,10 +289,11 @@ def main() -> None:
         optim="paged_adamw_8bit" if args.load_4bit else "adamw_torch",
         report_to="none",
         remove_unused_columns=False,
-        dataloader_num_workers=2,
+        dataloader_num_workers=args.num_workers,
         seed=args.seed,
         **{eval_key: "steps" if eval_ds else "no"},
         eval_steps=args.eval_steps if eval_ds else None,
+        **({"include_num_input_tokens_seen": "non_padding"} if "include_num_input_tokens_seen" in args_dict else {}),
     )
 
     trainer = Trainer(

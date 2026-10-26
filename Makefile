@@ -39,7 +39,7 @@ train: sft-data check-env
 		--data-dir sft/data \
 		--output-dir $(RUN) \
 		--load-4bit --epochs 2 --max-len 2048 \
-		--bs 1 --grad-accum 16 --lr 1e-4 --merge
+		--bs 2 --grad-accum 16 --lr 1e-4 --merge
 
 export: check-env
 	@test -d "$(RUN)-merged" || { echo "нет $(RUN)-merged: сначала запустите make train или укажите RUN=..."; exit 1; }
