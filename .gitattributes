@@ -1,0 +1,10 @@
+* text=auto eol=lf
+
+*.zip         binary
+*.gguf        binary
+*.safetensors binary
+*.png         binary
+*.jpg         binary
+
+*.sh          text eol=lf
+Makefile      text eol=lf

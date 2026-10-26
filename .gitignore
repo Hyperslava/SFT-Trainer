@@ -1,0 +1,44 @@
+# --- python ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# --- secrets / local config ---
+.env
+.env.local
+*.key
+*.pem
+
+# --- unpacked dataset (shipped as assets/codellmexp.zip) ---
+data/
+*.jsonl
+# рабочие копии датасета в корне: канонический источник — assets/codellmexp.zip
+source/
+seed/
+cwe_seeds/
+
+# --- generated SFT artefacts ---
+sft/data/
+sft/out/
+checkpoint-*/
+runs/
+
+# --- model weights ---
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+
+# --- OS junk ---
+*:Zone.Identifier
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- misc ---
+*.log
+.idea/
+.vscode/
