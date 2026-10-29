@@ -43,10 +43,10 @@ make setup        # .venv (python 3.12) + sft/requirements.txt
 make data         # sha256 + распаковка assets/codellmexp.zip -> data/codellmexp/
 make sft-data     # data/codellmexp/CodeLLMExp.jsonl -> sft/data/{train,val,test}.jsonl
 
-make train MODEL=Qwen/Qwen3-4B-Instruct-2507 RUN=sft/out/qwen3-4b
-make export RUN=sft/out/qwen3-4b          # sft/out/codellmexp-q4-Q4_K_M.gguf
+make train MODEL=Qwen/Qwen3-4B-Instruct-2507 RUN=sft/out/qwen-lora  # Или другую модель
+make export RUN=sft/out/qwen3-lora          # Например, там будет лежать модель sft/out/codellmexp-q4-Q4_K_M.gguf
 
-~/koboldcpp-linux-x64 --model sft/out/codellmexp-q4-Q4_K_M.gguf \
+~/koboldcpp-linux-x64 --model sft/out/codellmexp-q4-Q4_K_M.gguf \  # Проверка полученной модели
   --usecuda 0 --gpulayers 99 --contextsize 8192 --jinja --port 5001
 ```
 
