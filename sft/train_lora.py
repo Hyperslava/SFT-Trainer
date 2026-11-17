@@ -23,11 +23,14 @@ import inspect
 import json
 import math
 import os
+import random
 import re
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 import transformers
+from torch.utils.checkpoint import checkpoint
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
     AutoConfig,
@@ -69,18 +72,27 @@ def detect_text_targets(model) -> str | None:
 
 
 class ChatSFTDataset(torch.utils.data.Dataset):
-    """prompt/completion records -> token ids with a masked prompt."""
+    """prompt/completion records -> token ids with a masked prompt.
 
-    def __init__(self, path: str, tokenizer, max_len: int, enable_thinking: bool | None):
+    Everything is tokenized once up front: `lengths` feeds the length-grouped
+    sampler and __getitem__ stays a list lookup.
+    """
+
+    def __init__(self, path: str, tokenizer, max_len: int, enable_thinking: bool | None,
+                 limit: int = 0, seed: int = 0):
         with open(path, encoding="utf-8") as f:
-            self.rows = [json.loads(line) for line in f if line.strip()]
+            rows = [json.loads(line) for line in f if line.strip()]
+        if limit and len(rows) > limit:
+            rows = random.Random(seed).sample(rows, limit)
         self.tok = tokenizer
         self.max_len = max_len
         self.enable_thinking = enable_thinking
         self.eos_id = tokenizer.eos_token_id
+        self.items = [self._encode(row) for row in rows]
+        self.lengths = [len(it["input_ids"]) for it in self.items]
 
     def __len__(self) -> int:
-        return len(self.rows)
+        return len(self.items)
 
     def _render_prompt(self, row: dict) -> str:
         messages = [
@@ -96,8 +108,7 @@ class ChatSFTDataset(torch.utils.data.Dataset):
             kwargs.pop("enable_thinking", None)
             return self.tok.apply_chat_template(messages, **kwargs)
 
-    def __getitem__(self, idx: int) -> dict:
-        row = self.rows[idx]
+    def _encode(self, row: dict) -> dict:
         prompt_ids = self.tok(self._render_prompt(row), add_special_tokens=False)["input_ids"]
         answer_ids = self.tok(row["assistant"], add_special_tokens=False)["input_ids"]
         if self.eos_id is not None:
@@ -121,6 +132,9 @@ class ChatSFTDataset(torch.utils.data.Dataset):
             "attention_mask": [1] * len(input_ids),
         }
 
+    def __getitem__(self, idx: int) -> dict:
+        return self.items[idx]
+
 
 class PadCollator:
     def __init__(self, pad_token_id: int):
@@ -137,6 +151,100 @@ class PadCollator:
         return {k: torch.tensor(v, dtype=torch.long) for k, v in batch.items()}
 
 
+class LengthGroupedSampler(torch.utils.data.Sampler):
+    """Shuffle, then sort by length inside chunks of `chunk_batches` batches.
+
+    Neighbouring examples have similar length, so padding in a batch is small;
+    batches themselves are shuffled so the order stays random.
+    """
+
+    def __init__(self, lengths: list[int], batch_size: int, seed: int, chunk_batches: int = 32):
+        self.lengths = lengths
+        self.bs = batch_size
+        self.seed = seed
+        self.chunk = batch_size * chunk_batches
+        self.epoch = 0
+
+    def __len__(self) -> int:
+        return len(self.lengths)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+        idx = list(range(len(self.lengths)))
+        rng.shuffle(idx)
+        batches = []
+        for i in range(0, len(idx), self.chunk):
+            part = sorted(idx[i : i + self.chunk], key=self.lengths.__getitem__, reverse=True)
+            batches += [part[j : j + self.bs] for j in range(0, len(part), self.bs)]
+        rng.shuffle(batches)
+        return iter([i for b in batches for i in b])
+
+
+LOSS_CHUNK = 1024  # answer tokens per lm_head + cross-entropy block
+
+
+def _ce_sum(head, hidden, labels):
+    return F.cross_entropy(head(hidden).float(), labels, reduction="sum")
+
+
+class FastSFTTrainer(Trainer):
+    """Trainer with length-grouped batches and an answer-only lm_head.
+
+    The prompt (system + code) is masked, yet the stock loss still runs the
+    lm_head over every position. With a ~250k vocabulary that is a large share
+    of the step, so here the lm_head is applied only to positions that have a
+    label, in checkpointed chunks (full logits are never kept in memory).
+    """
+
+    def __init__(self, *args, group_by_length: bool = True, answer_only_loss: bool = True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.group_by_length = group_by_length
+        self.answer_only_loss = answer_only_loss
+
+    def _get_train_sampler(self, *args, **kwargs):
+        ds = self.train_dataset
+        if not self.group_by_length or not hasattr(ds, "lengths"):
+            return super()._get_train_sampler(*args, **kwargs)
+        return LengthGroupedSampler(ds.lengths, self.args.per_device_train_batch_size, self.args.seed)
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        base = model.get_base_model() if hasattr(model, "get_base_model") else model
+        inner, head = getattr(base, "model", None), getattr(base, "lm_head", None)
+        if not self.answer_only_loss or inner is None or head is None:
+            return super().compute_loss(
+                model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
+            )
+
+        out = inner(
+            input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"], use_cache=False
+        )
+        labels = inputs["labels"][:, 1:]
+        mask = labels != IGNORE_INDEX
+        hidden, targets = out.last_hidden_state[:, :-1][mask], labels[mask]
+
+        total = hidden.new_zeros((), dtype=torch.float32)
+        for i in range(0, hidden.size(0), LOSS_CHUNK):
+            total = total + checkpoint(
+                _ce_sum, head, hidden[i : i + LOSS_CHUNK], targets[i : i + LOSS_CHUNK],
+                use_reentrant=False,
+            )
+        if num_items_in_batch is not None and self.model_accepts_loss_kwargs:
+            loss = total / num_items_in_batch
+        else:
+            loss = total / mask.sum().clamp(min=1)
+        return (loss, {"loss": loss}) if return_outputs else loss
+
+
+def estimate_params(config) -> float:
+    """Rough parameter count of the language model (dense transformer formula)."""
+    t = getattr(config, "text_config", None) or config
+    h = getattr(t, "hidden_size", 0)
+    inter = getattr(t, "intermediate_size", 0) or 4 * h
+    layers = getattr(t, "num_hidden_layers", 0)
+    return layers * (4 * h * h + 3 * h * inter) + getattr(t, "vocab_size", 0) * h
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", required=True, help="HF id or local dir of the base model")
@@ -148,8 +256,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=float, default=2.0)
     p.add_argument("--max-steps", type=int, default=-1, help="debug: stop after N optimizer steps")
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--bs", type=int, default=1, help="per-device train batch size")
-    p.add_argument("--grad-accum", type=int, default=16)
+    p.add_argument("--bs", type=int, default=4, help="per-device train batch size")
+    p.add_argument("--grad-accum", type=int, default=4)
     p.add_argument("--num-workers", type=int, default=2, help="dataloader workers (raise on a fast GPU)")
     p.add_argument("--max-len", type=int, default=2048)
     p.add_argument("--lora-r", type=int, default=16)
@@ -157,8 +265,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lora-dropout", type=float, default=0.05)
     p.add_argument("--target-modules", default="all-linear",
                    help="'all-linear' or a comma separated list (q_proj,k_proj,...)")
-    p.add_argument("--load-4bit", action="store_true", help="QLoRA (needs bitsandbytes)")
-    p.add_argument("--no-gradient-checkpointing", action="store_true")
+    p.add_argument("--load-4bit", action="store_true", help="force QLoRA (needs bitsandbytes)")
+    p.add_argument("--no-4bit", action="store_true", help="force bf16 LoRA")
+    p.add_argument("--no-gradient-checkpointing", action="store_true", help="force checkpointing off")
+    p.add_argument("--gradient-checkpointing", action="store_true", help="force checkpointing on")
+    p.add_argument("--no-group-by-length", action="store_true",
+                   help="plain random batches instead of length-grouped ones")
+    p.add_argument("--no-answer-only-loss", action="store_true",
+                   help="stock HF loss (lm_head over all positions)")
+    p.add_argument("--eval-samples", type=int, default=256, help="val subset size (0 = all)")
+    p.add_argument("--eval-bs", type=int, default=8)
     p.add_argument("--merge", action="store_true", help="also save the merged fp16/bf16 model")
     p.add_argument("--merge-dir", default=None, help="where to save the merged model")
     p.add_argument("--eval-steps", type=int, default=200)
@@ -194,6 +310,19 @@ def main() -> None:
             "AutoModelForImageTextToText; upgrade transformers or pick a text-only base."
         )
     model_cls = AutoModelForImageTextToText if is_vl else AutoModelForCausalLM
+
+    # QLoRA only pays off when bf16 weights do not fit; on small models the nf4
+    # dequantisation just slows every step. Same for gradient checkpointing.
+    n_params = estimate_params(config)
+    if args.load_4bit and args.no_4bit:
+        raise SystemExit("--load-4bit and --no-4bit are mutually exclusive")
+    use_4bit = args.load_4bit or (not args.no_4bit and use_cuda and n_params > 3.0e9)
+    if args.no_gradient_checkpointing and args.gradient_checkpointing:
+        raise SystemExit("--gradient-checkpointing and --no-gradient-checkpointing are mutually exclusive")
+    use_ckpt = args.gradient_checkpointing or (
+        not args.no_gradient_checkpointing and (use_4bit or n_params > 1.2e9)
+    )
+    print(f"~{n_params / 1e9:.1f}B params -> 4-bit: {use_4bit}, gradient checkpointing: {use_ckpt}")
     if is_vl:
         print(f"vision-language model ({config.model_type}): only the language tower is trained")
 
@@ -201,7 +330,7 @@ def main() -> None:
     model_kwargs: dict = dict(trust_remote_code=True, **{dtype_key: dtype})
     if use_cuda:
         model_kwargs["device_map"] = {"": 0}
-    if args.load_4bit:
+    if use_4bit:
         from transformers import BitsAndBytesConfig
 
         model_kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -215,11 +344,9 @@ def main() -> None:
     model = model_cls.from_pretrained(args.model, **model_kwargs)
     model.config.use_cache = False
 
-    if args.load_4bit:
-        model = prepare_model_for_kbit_training(
-            model, use_gradient_checkpointing=not args.no_gradient_checkpointing
-        )
-    elif not args.no_gradient_checkpointing:
+    if use_4bit:
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=use_ckpt)
+    elif use_ckpt:
         model.enable_input_require_grads()
         model.gradient_checkpointing_enable()
 
@@ -255,7 +382,9 @@ def main() -> None:
     train_ds = ChatSFTDataset(train_path, tokenizer, args.max_len, thinking)
     val_path = Path(args.data_dir) / "val.jsonl"
     eval_ds = (
-        ChatSFTDataset(val_path, tokenizer, args.max_len, thinking) if val_path.exists() else None
+        ChatSFTDataset(val_path, tokenizer, args.max_len, thinking,
+                       limit=args.eval_samples, seed=args.seed)
+        if val_path.exists() else None
     )
     print(f"train examples: {len(train_ds)}  eval examples: {len(eval_ds) if eval_ds else 0}")
 
@@ -274,7 +403,7 @@ def main() -> None:
         num_train_epochs=args.epochs,
         max_steps=args.max_steps,
         per_device_train_batch_size=args.bs,
-        per_device_eval_batch_size=1,
+        per_device_eval_batch_size=args.eval_bs,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         lr_scheduler_type="cosine",
@@ -284,9 +413,9 @@ def main() -> None:
         save_total_limit=2,
         bf16=bf16,
         fp16=use_cuda and not bf16,
-        gradient_checkpointing=not args.no_gradient_checkpointing,
+        gradient_checkpointing=use_ckpt,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        optim="paged_adamw_8bit" if args.load_4bit else "adamw_torch",
+        optim="paged_adamw_8bit" if use_4bit else ("adamw_torch_fused" if use_cuda else "adamw_torch"),
         report_to="none",
         remove_unused_columns=False,
         dataloader_num_workers=args.num_workers,
@@ -296,7 +425,9 @@ def main() -> None:
         **({"include_num_input_tokens_seen": "non_padding"} if "include_num_input_tokens_seen" in args_dict else {}),
     )
 
-    trainer = Trainer(
+    trainer = FastSFTTrainer(
+        group_by_length=not args.no_group_by_length,
+        answer_only_loss=not args.no_answer_only_loss,
         model=model,
         args=training_args,
         train_dataset=train_ds,

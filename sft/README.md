@@ -122,6 +122,9 @@ VRAM, а не половина. VL берите, если хотите пере�
 make train MODEL=Qwen/Qwen3-4B-Instruct-2507 RUN=sft/out/qwen3-4b
 ```
 
+Или в окне: `make gui` — параметры задаются в форме, после «Начать обучение»
+окно закрывается, а процесс идёт в том же терминале (см. `sft/gui.py`).
+
 Или напрямую, с полным контролем параметров:
 
 ```bash
@@ -145,6 +148,18 @@ python sft/train_lora.py \
 * LoRA `r=16, alpha=32`, `target_modules="all-linear"` (работает для любой
   архитектуры), gradient checkpointing, `paged_adamw_8bit`;
 * чекпоинты и eval каждые 200 шагов, адаптер + слитая модель в `--output-dir`.
+
+Ускорение обучения (всё включено по умолчанию):
+
+* квантизация и gradient checkpointing выбираются по размеру модели: до ~3B
+  параметров — bf16 LoRA без 4-bit, checkpointing выключается до ~1.2B.
+  Переопределить: `--load-4bit` / `--no-4bit`, `--gradient-checkpointing` /
+  `--no-gradient-checkpointing`;
+* `--bs 4 --grad-accum 4` и батчи близкой длины (`--no-group-by-length` отключает);
+* lm_head и cross-entropy считаются только по токенам ответа, чанками
+  (`--no-answer-only-loss` возвращает стандартный loss);
+* eval на подвыборке val (`--eval-samples 256`, `--eval-bs 8`);
+* для быстрого пути Qwen3.5 нужны `causal-conv1d` **и** `flash-linear-attention`.
 
 Ориентиры: ~1 060 шагов на эпоху, на 4060 Laptop это порядка 30–50 минут на
 эпоху. Если хочется быстрее — `--max-len 1536` (90-й процентиль примеров —

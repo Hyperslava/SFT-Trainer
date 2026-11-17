@@ -7,12 +7,13 @@ RUN   ?= sft/out/run
 TASKS ?= audit,fix
 
 .DEFAULT_GOAL := help
-.PHONY: help setup check-env data sft-data train export eval zip clean
+.PHONY: help setup check-env data sft-data gui train export eval zip clean
 
 help:
 	@echo "make setup      создает .venv и ставит зависимости"
 	@echo "make data       распаковывает $(ZIP) в data/codellmexp/"
 	@echo "make sft-data   собирает sft/data/{train,val,test}.jsonl из датасета"
+	@echo "make gui        окно с параметрами обучения (затем обучение в терминале)"
 	@echo "make train      QLoRA SFT:  make train MODEL=Qwen/Qwen3-4B-Instruct-2507 RUN=sft/out/my-run"
 	@echo "make export     merge -> GGUF Q4_K_M для koboldcpp"
 	@echo "make eval       оценка модели через koboldcpp API"
@@ -33,13 +34,17 @@ data:
 sft-data: data
 	$(PY) sft/prepare_data.py --outdir sft/data --tasks $(TASKS)
 
+gui:
+	@test -x "$(VENV)/bin/python" || { echo "нет $(VENV): запустите 'make setup'"; exit 1; }
+	$(VENV)/bin/python sft/gui.py
+
 train: sft-data check-env
 	$(VENV)/bin/python sft/train_lora.py \
 		--model $(MODEL) \
 		--data-dir sft/data \
 		--output-dir $(RUN) \
-		--load-4bit --epochs 2 --max-len 2048 \
-		--bs 2 --grad-accum 16 --lr 1e-4 --merge
+		--epochs 2 --max-len 2048 \
+		--bs 4 --grad-accum 4 --lr 1e-4 --merge
 
 export: check-env
 	@test -d "$(RUN)-merged" || { echo "нет $(RUN)-merged: сначала запустите make train или укажите RUN=..."; exit 1; }

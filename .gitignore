@@ -42,3 +42,4 @@ desktop.ini
 *.log
 .idea/
 .vscode/
+sft/third_party/

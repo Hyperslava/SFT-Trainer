@@ -12,7 +12,7 @@
 
 ```
 .
-├── Makefile                  # make setup / data / sft-data / train / export / eval
+├── Makefile                  # make setup / data / sft-data / gui / train / export / eval
 ├── assets/
 │   ├── codellmexp.zip        # датасет, 7.1 MiB, CC BY 4.0
 │   └── SHA256SUMS            # контрольная сумма архива
@@ -25,6 +25,7 @@
 ├── sft/
 │   ├── prepare_data.py       # CodeLLMExp.jsonl -> sft/data/*.jsonl
 │   ├── train_lora.py         # LoRA/QLoRA SFT (transformers + peft)
+│   ├── gui.py                # окно с параметрами обучения
 │   ├── export_gguf.sh        # merge -> GGUF bf16 -> Q4_K_M
 │   ├── evaluate.py           # оценка через koboldcpp API
 │   ├── requirements.txt
@@ -53,6 +54,26 @@ make export RUN=sft/out/qwen3-lora          # Например, там буде�
 После `make sft-data` получается 16 960 train / 920 val / 955 test примеров
 (задачи `audit` и `fix`). Подробности, гиперпараметры под 8 ГБ VRAM, VL-модели,
 конвертация в GGUF и метрики — в [`sft/README.md`](sft/README.md).
+
+## GUI
+
+Вместо правки команд в терминале параметры можно задать в окне:
+
+```bash
+make gui
+# или: .venv/bin/python sft/gui.py
+```
+
+Одно окно с полями (модель, каталоги, эпохи, `bs`, `grad_accum`, `lr`,
+`max-len`, LoRA `r/alpha/dropout`, workers, eval/save steps, seed, чекбоксы
+4-bit / merge / gradient checkpointing / thinking), живым предпросмотром
+команды и счётчиком шагов. По кнопке «Начать обучение» окно закрывается, а
+процесс через `exec` продолжается в том же терминале — видны обычные логи и
+прогресс-бар Trainer. Последние значения запоминаются в
+`~/.config/codellmexp-sft/gui.json`.
+
+Если запустить окно не из терминала (двойным кликом), оно попробует открыть
+`x-terminal-emulator` / `gnome-terminal` / `konsole` / `xfce4-terminal` / `xterm`.
 
 ## Датасет
 
