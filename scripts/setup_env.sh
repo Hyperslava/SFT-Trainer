@@ -9,6 +9,8 @@ if command -v uv >/dev/null 2>&1; then
   echo ">>> using uv (python $PYVER)"
   uv venv --python "$PYVER" .venv
   uv pip install --python .venv/bin/python -r sft/requirements.txt
+  uv pip install flash-linear-attention
+  uv pip install --no-build-isolation causal-conv1d
 else
   echo ">>> uv not found, using python3 -m venv"
   python3 -m venv .venv
